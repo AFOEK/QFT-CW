@@ -63,6 +63,7 @@ Q_BATCH_SIZE=32
 SAVE_PLOTS=True
 SAVE_RECONSTRUCTED=True
 RUN_NOISE=True
+NOISE_MAX_WINDOWS=32
 
 SAVE_CIRCUIT_RESOURCES=True
 SAVE_CIRCUIT_DRAWINGS=True
@@ -1076,8 +1077,16 @@ def save_noise_plots(noise_results, plots_dir):
         for i, device in enumerate(devices):
             vals = []
             for t in transforms:
-                row = subdf[(subdf["device"] == device) & (subdf["transform"] == t)]
-                vals.append(row[value_col].iloc[0] if not row.empty else np.nan)
+                row=subdf[
+                    (subdf["device"]==device)
+                    & (subdf["transform"]==t)
+                ]
+
+                vals.append(
+                    row[value_col].mean()
+                    if not row.empty
+                    else np.nan
+                )
             plt.bar(x + (i - (len(devices)-1)/2)*width, vals, width=width, label=device)
 
         plt.xticks(x, transforms)
@@ -1956,7 +1965,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
         )
         plt.close()
 
-def run_noise_analysis(clean_signal, noisy_signal, output_csv):
+def run_noise_analysis(noise_metadata,output_csv):
     fake=FakeSherbrooke()
     sherbrooke_noise=NoiseModel.from_backend(fake)
 
@@ -1966,16 +1975,36 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
         ),
         "FakeSherbrooke":AerSimulator(
             method="density_matrix",
-            noise_model=sherbrooke_noise
+            noise_model=sherbrooke_noise,
         ),
     }
 
-    noisy_transforms = {
-        "QFT": cached_iqft,
-        "QDCT": cached_qdct,
-        "QDST": cached_qdst,
-        "QDWT": cached_qhaar,
+    noisy_transforms={
+        "QFT":cached_iqft,
+        "QDCT":cached_qdct,
+        "QDST":cached_qdst,
+        "QDWT":cached_qhaar,
     }
+
+    def select_noise_window_indices(clean_signal):
+        windows,_,_=split_windows(clean_signal)
+        energies=np.linalg.norm(windows,axis=1)
+        valid=np.flatnonzero(energies>1e-15)
+
+        if len(valid)==0:
+            return np.array([],dtype=int)
+
+        if len(valid)<=NOISE_MAX_WINDOWS:
+            return valid
+
+        positions=np.linspace(
+            0,
+            len(valid)-1,
+            NOISE_MAX_WINDOWS,
+            dtype=int,
+        )
+
+        return valid[positions]
 
     def run_noisy_transform(x,transform,simulator):
         qc,norm,n=build_transform_pipeline(x,transform)
@@ -1987,36 +2016,48 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
                 "depth":0,
                 "size":0,
                 "ops":{},
+                "simulation_time_s":0.0,
             }
 
-        # First compile only the real quantum circuit.
         tqc=transpile(
             qc,
             simulator,
             optimization_level=1,
         )
 
-        # Ideal reference of the exact transpiled circuit.
         ideal=Statevector.from_instruction(tqc)
 
-        # Aer-only save instruction is added AFTER transpilation.
         noisy_qc=tqc.copy()
         noisy_qc.save_density_matrix()
 
         t0=perf_counter()
         result=simulator.run(noisy_qc).result()
         simulation_time=perf_counter()-t0
-        rho=DensityMatrix(result.data(0)["density_matrix"])
 
-        fidelity=float(state_fidelity(ideal,rho))
+        rho=DensityMatrix(
+            result.data(0)["density_matrix"]
+        )
+
+        fidelity=float(
+            state_fidelity(
+                ideal,
+                rho,
+            )
+        )
+
         leakage=0.0
 
         if transform.num_qubits==n+1:
             N=2**n
-            diagonal=np.real(np.diag(rho.data))
+            diagonal=np.real(
+                np.diag(rho.data)
+            )
+
             leakage=max(
                 0.0,
-                1.0-float(np.sum(diagonal[:N])),
+                1.0-float(
+                    np.sum(diagonal[:N])
+                ),
             )
 
         return {
@@ -2028,62 +2069,126 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
             "simulation_time_s":simulation_time,
         }
 
-    def noise_analyze_recording(signal, simulator, device_name):
-        windows, _, _ = split_windows(signal)
-        rows = []
+    def noise_analyze_recording(
+        signal,
+        window_indices,
+        simulator,
+        device_name,
+        signal_type,
+        row,
+    ):
+        windows,_,_=split_windows(signal)
 
-        for name, builder in noisy_transforms.items():
-            fidelities = []
-            leakages = []
-            depths = []
-            sizes = []
-            twoq = []
-            simulation_times = []
+        window_indices=np.asarray(
+            window_indices,
+            dtype=int,
+        )
 
-            for window in windows:
-                if np.linalg.norm(window) <= 1e-15:
+        windows=windows[window_indices]
+
+        rows=[]
+
+        print(
+            f"    {signal_type}: "
+            f"{len(windows)} windows"
+        )
+
+        for name,builder in noisy_transforms.items():
+            fidelities=[]
+            leakages=[]
+            depths=[]
+            sizes=[]
+            twoq=[]
+            simulation_times=[]
+
+            print(
+                f"      {name}: 0/{len(windows)}",
+                end="",
+                flush=True,
+            )
+
+            for wi,window in enumerate(windows,1):
+                if np.linalg.norm(window)<=1e-15:
                     continue
 
-                n = int(np.log2(len(window)))
-                m = run_noisy_transform(
+                n=int(np.log2(len(window)))
+
+                m=run_noisy_transform(
                     window,
                     builder(n),
                     simulator,
                 )
 
-                fidelities.append(m["fidelity"])
-                leakages.append(m["leakage"])
-                depths.append(m["depth"])
-                sizes.append(m["size"])
-                simulation_times.append(m["simulation_time_s"])
+                fidelities.append(
+                    m["fidelity"]
+                )
+                leakages.append(
+                    m["leakage"]
+                )
+                depths.append(
+                    m["depth"]
+                )
+                sizes.append(
+                    m["size"]
+                )
+                simulation_times.append(
+                    m["simulation_time_s"]
+                )
 
-                ops = (
+                ops=(
                     m["ops"]
-                    if isinstance(m["ops"], dict)
+                    if isinstance(m["ops"],dict)
                     else dict(m["ops"])
                 )
 
-                twoq_count = sum(
-                    ops.get(g, 0)
-                    for g in ["cx", "cz", "cp", "swap", "ecr"]
+                twoq_count=sum(
+                    ops.get(g,0)
+                    for g in [
+                        "cx",
+                        "cz",
+                        "cp",
+                        "swap",
+                        "ecr",
+                    ]
                 )
 
-                twoq.append(twoq_count)
+                twoq.append(
+                    twoq_count
+                )
+
+                if wi%4==0 or wi==len(windows):
+                    print(
+                        f"\r      {name}: "
+                        f"{wi}/{len(windows)}",
+                        end="",
+                        flush=True,
+                    )
+
+            print()
 
             rows.append({
-                "device": device_name,
-                "transform": name,
-                "fidelity_mean": float(np.mean(fidelities)) if fidelities else np.nan,
-                "fidelity_std": float(np.std(fidelities)) if fidelities else np.nan,
-                "fidelity_min": float(np.min(fidelities)) if fidelities else np.nan,
-                "leakage_mean": float(np.mean(leakages)) if leakages else np.nan,
-                "leakage_max": float(np.max(leakages)) if leakages else np.nan,
-                "depth_mean": float(np.mean(depths)) if depths else np.nan,
-                "depth_std": float(np.std(depths)) if depths else np.nan,
-                "size_mean": float(np.mean(sizes)) if sizes else np.nan,
-                "size_std": float(np.std(sizes)) if sizes else np.nan,
-                "twoq_mean": float(np.mean(twoq)) if twoq else np.nan,
-                "twoq_std": float(np.std(twoq)) if twoq else np.nan,
+                "message_id":row["message_id"],
+                "wpm":row["wpm"],
+                "snr_requested_db":(
+                    np.nan
+                    if signal_type=="clean"
+                    else row["snr_requested_db"]
+                ),
+                "signal_type":signal_type,
+                "device":device_name,
+                "transform":name,
+                "windows_tested":len(fidelities),
+                "fidelity_mean":float(np.mean(fidelities)) if fidelities else np.nan,
+                "fidelity_std":float(np.std(fidelities)) if fidelities else np.nan,
+                "fidelity_min":float(np.min(fidelities)) if fidelities else np.nan,
+                "leakage_mean":float(np.mean(leakages)) if leakages else np.nan,
+                "leakage_max":float(np.max(leakages)) if leakages else np.nan,
+                "depth_mean":float(np.mean(depths)) if depths else np.nan,
+                "depth_std":float(np.std(depths)) if depths else np.nan,
+                "size_mean":float(np.mean(sizes)) if sizes else np.nan,
+                "size_std":float(np.std(sizes)) if sizes else np.nan,
+                "twoq_mean":float(np.mean(twoq)) if twoq else np.nan,
+                "twoq_std":float(np.std(twoq)) if twoq else np.nan,
                 "simulation_time_mean_s":float(np.mean(simulation_times)) if simulation_times else np.nan,
                 "simulation_time_std_s":float(np.std(simulation_times)) if simulation_times else np.nan,
                 "simulation_time_total_s":float(np.sum(simulation_times)) if simulation_times else np.nan,
@@ -2091,39 +2196,110 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
 
         return pd.DataFrame(rows)
 
-    all_noise_results = []
+    all_noise_results=[]
+    clean_done=set()
 
-    for device_name, simulator in noise_simulators.items():
-        print(f"Noise device: {device_name}")
+    total_rows=len(noise_metadata)
 
-        for signal_type, signal in {
-            "clean": clean_signal,
-            "noisy": noisy_signal,
-        }.items():
+    for ri,(_,row) in enumerate(
+        noise_metadata.iterrows(),
+        1,
+    ):
+        sample=load_cw_sample(row)
 
-            d = noise_analyze_recording(
-                signal,
-                simulator,
-                device_name,
+        clean_id=(
+            row["message_id"],
+            row["wpm"],
+        )
+
+        include_clean=(
+            clean_id not in clean_done
+        )
+
+        window_indices=select_noise_window_indices(
+            sample["clean"]
+        )
+
+        if len(window_indices)==0:
+            print(
+                f"Skipping msg={row['message_id']} "
+                f"wpm={row['wpm']}: no valid windows"
+            )
+            continue
+
+        print(
+            f"Noise recording "
+            f"[{ri}/{total_rows}] "
+            f"msg={row['message_id']} "
+            f"wpm={row['wpm']} "
+            f"snr={row['snr_requested_db']} "
+            f"windows={len(window_indices)}"
+        )
+
+        signal_cases=[
+            (
+                "noisy",
+                sample["noisy"],
+            ),
+        ]
+
+        if include_clean:
+            signal_cases.insert(
+                0,
+                (
+                    "clean",
+                    sample["clean"],
+                ),
             )
 
-            d["signal_type"] = signal_type
-            all_noise_results.append(d)
+        for device_name,simulator in noise_simulators.items():
+            print(
+                f"  Noise device: {device_name}"
+            )
 
-    noise_results = pd.concat(
+            for signal_type,signal in signal_cases:
+                d=noise_analyze_recording(
+                    signal,
+                    window_indices,
+                    simulator,
+                    device_name,
+                    signal_type,
+                    row,
+                )
+
+                all_noise_results.append(d)
+
+        if include_clean:
+            clean_done.add(clean_id)
+
+    if not all_noise_results:
+        raise ValueError(
+            "No quantum noise results were generated."
+        )
+
+    noise_results=pd.concat(
         all_noise_results,
         ignore_index=True,
     )
 
-    output_csv = Path(output_csv)
-    noise_results.to_csv(output_csv, index=False)
+    output_csv=Path(output_csv)
+
+    noise_results.to_csv(
+        output_csv,
+        index=False,
+    )
 
     save_noise_plots(
         noise_results,
-        output_csv.parent / "plots",
+        output_csv.parent/"plots",
     )
 
-    print(f"Saved noise results: {output_csv.resolve()}")
+    print(
+        f"Saved noise results: "
+        f"{output_csv.resolve()}"
+    )
+
+    return noise_results
 
 
 def configure_paths(dataset):
@@ -2267,10 +2443,10 @@ def main():
         )
 
     if RUN_NOISE:
-        # Use the first selected row as the notebook-style representative recording.
-        row = experiment_metadata.iloc[0]
-        sample = load_cw_sample(row)
-        run_noise_analysis(sample["clean"], sample["noisy"], output_dir / "cw_quantum_noise_results.csv")
+        run_noise_analysis(
+            quantum_metadata,
+            output_dir/"cw_quantum_noise_results.csv",
+        )
 
 
 if __name__ == "__main__":
