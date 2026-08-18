@@ -64,6 +64,12 @@ SAVE_PLOTS=True
 SAVE_RECONSTRUCTED=True
 RUN_NOISE=True
 
+SAVE_CIRCUIT_RESOURCES=True
+SAVE_CIRCUIT_DRAWINGS=True
+SAVE_DETAILED_CIRCUITS=False
+RESOURCE_OPT_LEVEL=1
+RESOURCE_BASIS=["rz","sx","x","cx"]
+
 
 def stabilize_amplitudes(x, zero_tol=1e-13):
     a = np.asarray(x, dtype=np.complex128).copy()
@@ -575,16 +581,29 @@ def prune_coeffs(coeffs, retention, fourier=False):
 #     a /= np.sqrt(np.vdot(a, a).real)
 #     return a
 
-def build_transform_pipeline(x, transform):
-    x = validate_window(x)
-    norm = np.linalg.norm(x)
-    if norm <= 1e-15: return None, 0.0, int(np.log2(len(x)))
+def build_transform_pipeline(x,transform):
+    x=validate_window(x)
+    x=np.asarray(x,dtype=np.complex128)
+    norm=np.linalg.norm(x)
+    n=int(np.log2(len(x)))
 
-    n = int(np.log2(len(x)))
-    qc = QuantumCircuit(transform.num_qubits)
-    qc.append(StatePreparation((x / norm).astype(np.complex128)), range(n))
-    qc.compose(transform, qubits=range(transform.num_qubits), inplace=True)
-    return qc, norm, n
+    if norm<=1e-15:
+        return None,0.0,n
+
+    amplitudes=stabilize_amplitudes(x)
+    if amplitudes is None:
+        return None,0.0,n
+
+    prep_definition,perturbation,prep_method=synthesize_stateprep(amplitudes)
+
+    if prep_method!="exact":
+        print(f"Noise StatePrep fallback method={prep_method} perturbation={perturbation:.3e}")
+
+    qc=QuantumCircuit(transform.num_qubits)
+    qc.compose(prep_definition,qubits=range(n),inplace=True)
+    qc.compose(transform,qubits=range(transform.num_qubits),inplace=True)
+
+    return qc,norm,n
 
 def compress_recording(signal, forward_fn, inverse_fn, retention_ratios, fourier=False):
     windows, pad, original_length = split_windows(signal)
@@ -960,6 +979,13 @@ def compress_recording_classical(signal, name, retention_ratios):
 
     return results
 
+def estimated_qpu_duration_us(qc,target):
+    try:
+        return float(qc.estimate_duration(target,unit="u"))
+    except Exception as e:
+        print(f"QPU duration unavailable: {e}")
+        return np.nan
+
 
 def compress_recording_quantum(signal, name, retention_ratios):
     windows, _, original_length = split_windows(signal)
@@ -1095,6 +1121,51 @@ def save_noise_plots(noise_results, plots_dir):
             plt.tight_layout()
             plt.savefig(plots_dir / f"19_noise_fidelity_drop_{signal_type}.png", dpi=300, bbox_inches="tight")
             plt.close()
+
+    fake=df[df["device"]=="FakeSherbrooke"].copy()
+
+    if not fake.empty:
+        # 35 — Two-qubit cost vs fidelity
+        plt.figure(figsize=(9,6))
+        sns.scatterplot(
+            data=fake,
+            x="twoq_mean",
+            y="fidelity_mean",
+            hue="transform",
+            style="signal_type",
+            s=120,
+        )
+        plt.xlabel("Mean two-qubit gate count")
+        plt.ylabel("Mean state fidelity")
+        plt.title("Quantum Resource Cost vs Noise Fidelity")
+        plt.tight_layout()
+        plt.savefig(
+            plots_dir/"35_resource_cost_vs_fidelity.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+
+        # 36 — Depth vs fidelity
+        plt.figure(figsize=(9,6))
+        sns.scatterplot(
+            data=fake,
+            x="depth_mean",
+            y="fidelity_mean",
+            hue="transform",
+            style="signal_type",
+            s=120,
+        )
+        plt.xlabel("Mean transpiled circuit depth")
+        plt.ylabel("Mean state fidelity")
+        plt.title("Circuit Depth vs FakeSherbrooke Fidelity")
+        plt.tight_layout()
+        plt.savefig(
+            plots_dir/"36_depth_vs_fidelity.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
 
 def save_plots(full_results,plots_dir):
     plots_dir=Path(plots_dir)
@@ -1347,6 +1418,543 @@ def save_plots(full_results,plots_dir):
 
     print(f"Saved plots to: {plots_dir.resolve()}")
 
+def circuit_resource_metrics(qc):
+    ops=dict(qc.count_ops())
+
+    oneq=sum(
+        1 for inst in qc.data
+        if inst.operation.num_qubits==1
+    )
+    twoq=sum(
+        1 for inst in qc.data
+        if inst.operation.num_qubits==2
+    )
+    multiq=sum(
+        1 for inst in qc.data
+        if inst.operation.num_qubits>2
+    )
+
+    try:
+        twoq_depth=qc.depth(
+            lambda inst: inst.operation.num_qubits==2
+        )
+    except Exception:
+        twoq_depth=np.nan
+
+    return {
+        "qubits":qc.num_qubits,
+        "depth":qc.depth(),
+        "size":qc.size(),
+        "oneq":oneq,
+        "twoq":twoq,
+        "multiq":multiq,
+        "twoq_depth":twoq_depth,
+        "ops":ops,
+    }
+
+
+def build_resource_pipeline(window,transform):
+    x=validate_window(window)
+    x=np.asarray(x,dtype=np.complex128)
+    norm=np.linalg.norm(x)
+    n=int(np.log2(len(x)))
+
+    if norm<=1e-15:
+        raise ValueError("Representative resource window is empty.")
+
+    amplitudes=stabilize_amplitudes(x)
+
+    if amplitudes is None:
+        raise ValueError("Could not prepare representative amplitudes.")
+
+    prep_definition,perturbation,prep_method=synthesize_stateprep(amplitudes)
+
+    if prep_method!="exact":
+        print(
+            f"Resource StatePrep fallback "
+            f"method={prep_method} "
+            f"perturbation={perturbation:.3e}"
+        )
+
+    qc=QuantumCircuit(transform.num_qubits)
+    qc.compose(
+        prep_definition,
+        qubits=range(n),
+        inplace=True,
+    )
+    qc.compose(
+        transform,
+        qubits=range(transform.num_qubits),
+        inplace=True,
+    )
+
+    return qc
+
+
+def save_circuit_drawing(qc,path,label):
+    wrapper=QuantumCircuit(qc.num_qubits)
+    wrapper.append(
+        qc.to_instruction(label=label),
+        range(qc.num_qubits),
+    )
+
+    fig=wrapper.draw(
+        output="mpl",
+        fold=-1,
+        idle_wires=False,
+    )
+    fig.savefig(
+        path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+def save_detailed_circuit_drawing(qc,path):
+    fig=qc.draw(
+        output="mpl",
+        fold=40,
+        idle_wires=False,
+    )
+    fig.savefig(
+        path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+def save_quantum_circuit_resources(representative_window,output_dir):
+    output_dir=Path(output_dir)
+    plots_dir=output_dir/"plots"
+    circuits_dir=plots_dir/"circuits"
+
+    plots_dir.mkdir(parents=True,exist_ok=True)
+    circuits_dir.mkdir(parents=True,exist_ok=True)
+
+    n=int(np.log2(WINDOW_SIZE))
+    fake=FakeSherbrooke()
+
+    transform_builders={
+        "QFT":build_iqft,
+        "QDCT":build_qdct,
+        "QDST":build_qdst,
+        "QDWT":build_qhaar,
+    }
+
+    rows=[]
+    gate_rows=[]
+
+    for name,builder in transform_builders.items():
+        print(f"Resource analysis: {name}")
+
+        t0=perf_counter()
+        transform=builder(n)
+        transform_build_time=perf_counter()-t0
+
+        t0=perf_counter()
+        transform_basis=transpile(
+            transform,
+            basis_gates=RESOURCE_BASIS,
+            optimization_level=RESOURCE_OPT_LEVEL,
+            seed_transpiler=SEED,
+        )
+        transform_transpile_time=perf_counter()-t0
+
+        t0=perf_counter()
+        pipeline=build_resource_pipeline(
+            representative_window,
+            transform,
+        )
+        pipeline_build_time=perf_counter()-t0
+
+        t0=perf_counter()
+        pipeline_basis=transpile(
+            pipeline,
+            basis_gates=RESOURCE_BASIS,
+            optimization_level=RESOURCE_OPT_LEVEL,
+            seed_transpiler=SEED,
+        )
+        pipeline_transpile_time=perf_counter()-t0
+
+        t0=perf_counter()
+        device_pipeline=transpile(
+            pipeline,
+            fake,
+            optimization_level=RESOURCE_OPT_LEVEL,
+            seed_transpiler=SEED,
+        )
+        device_transpile_time=perf_counter()-t0
+
+        qpu_duration_us=estimated_qpu_duration_us(
+            device_pipeline,
+            fake.target,
+        )
+
+        circuits={
+            "transform_only":{
+                "qc":transform_basis,
+                "build_time_s":transform_build_time,
+                "transpile_time_s":transform_transpile_time,
+                "estimated_qpu_us":np.nan,
+            },
+            "stateprep_transform":{
+                "qc":pipeline_basis,
+                "build_time_s":pipeline_build_time,
+                "transpile_time_s":pipeline_transpile_time,
+                "estimated_qpu_us":np.nan,
+            },
+            "FakeSherbrooke":{
+                "qc":device_pipeline,
+                "build_time_s":pipeline_build_time,
+                "transpile_time_s":device_transpile_time,
+                "estimated_qpu_us":qpu_duration_us,
+            },
+        }
+
+        for scope,item in circuits.items():
+            qc=item["qc"]
+            m=circuit_resource_metrics(qc)
+
+            rows.append({
+                "transform":name,
+                "scope":scope,
+                "qubits":m["qubits"],
+                "depth":m["depth"],
+                "size":m["size"],
+                "oneq":m["oneq"],
+                "twoq":m["twoq"],
+                "multiq":m["multiq"],
+                "twoq_depth":m["twoq_depth"],
+                "build_time_s":item["build_time_s"],
+                "transpile_time_s":item["transpile_time_s"],
+                "estimated_qpu_us":item["estimated_qpu_us"],
+            })
+
+            for gate,count in m["ops"].items():
+                gate_rows.append({
+                    "transform":name,
+                    "scope":scope,
+                    "gate":gate,
+                    "count":int(count),
+                })
+
+        # -------------------------------------------------------------
+        # Circuit drawings
+        # -------------------------------------------------------------
+        if SAVE_CIRCUIT_DRAWINGS:
+            save_circuit_drawing(
+                transform,
+                circuits_dir/f"{name.lower()}_block.png",
+                name,
+            )
+
+            if SAVE_DETAILED_CIRCUITS:
+                save_detailed_circuit_drawing(
+                    transform,
+                    circuits_dir/f"{name.lower()}_detailed.png",
+                )
+
+    resources=pd.DataFrame(rows)
+    gates=pd.DataFrame(gate_rows)
+
+    resources.to_csv(
+        output_dir/"cw_quantum_circuit_resources.csv",
+        index=False,
+    )
+
+    gates.to_csv(
+        output_dir/"cw_quantum_gate_counts.csv",
+        index=False,
+    )
+
+    save_quantum_resource_plots(
+        resources,
+        gates,
+        plots_dir,
+    )
+
+    print(
+        "Saved quantum circuit resources: "
+        f"{(output_dir/'cw_quantum_circuit_resources.csv').resolve()}"
+    )
+
+    return resources, gates
+
+def save_quantum_resource_plots(resources,gates,plots_dir):
+    plots_dir=Path(plots_dir)
+    plots_dir.mkdir(parents=True,exist_ok=True)
+
+    scope_order=[
+        "transform_only",
+        "stateprep_transform",
+        "FakeSherbrooke",
+    ]
+
+    # 27 — Circuit depth
+    plt.figure(figsize=(10,6))
+    sns.barplot(
+        data=resources,
+        x="transform",
+        y="depth",
+        hue="scope",
+        hue_order=scope_order,
+    )
+    plt.xlabel("Quantum transform")
+    plt.ylabel("Circuit depth")
+    plt.title("Quantum Circuit Depth")
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir/"27_quantum_resource_depth.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    # 28 — Total circuit size
+    plt.figure(figsize=(10,6))
+    sns.barplot(
+        data=resources,
+        x="transform",
+        y="size",
+        hue="scope",
+        hue_order=scope_order,
+    )
+    plt.xlabel("Quantum transform")
+    plt.ylabel("Circuit operations")
+    plt.title("Quantum Circuit Size")
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir/"28_quantum_resource_size.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    # 29 — Two-qubit operation count
+    plt.figure(figsize=(10,6))
+    sns.barplot(
+        data=resources,
+        x="transform",
+        y="twoq",
+        hue="scope",
+        hue_order=scope_order,
+    )
+    plt.xlabel("Quantum transform")
+    plt.ylabel("Two-qubit operations")
+    plt.title("Quantum Two-Qubit Gate Cost")
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir/"29_quantum_resource_twoq.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    # 30 — Two-qubit depth
+    twoq=resources.dropna(subset=["twoq_depth"])
+
+    if not twoq.empty:
+        plt.figure(figsize=(10,6))
+        sns.barplot(
+            data=twoq,
+            x="transform",
+            y="twoq_depth",
+            hue="scope",
+            hue_order=scope_order,
+        )
+        plt.xlabel("Quantum transform")
+        plt.ylabel("Two-qubit depth")
+        plt.title("Quantum Two-Qubit Circuit Depth")
+        plt.tight_layout()
+        plt.savefig(
+            plots_dir/"30_quantum_resource_twoq_depth.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+
+    # 31 — Required qubits
+    transform_only=resources[
+        resources["scope"]=="transform_only"
+    ]
+
+    if not transform_only.empty:
+        plt.figure(figsize=(8,5))
+        sns.barplot(
+            data=transform_only,
+            x="transform",
+            y="qubits",
+        )
+        plt.xlabel("Quantum transform")
+        plt.ylabel("Qubits")
+        plt.title("Quantum Transform Qubit Requirements")
+        plt.tight_layout()
+        plt.savefig(
+            plots_dir/"31_quantum_resource_qubits.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+
+    # 32 — FakeSherbrooke native gate composition heatmap
+    device_gates=gates[
+        gates["scope"]=="FakeSherbrooke"
+    ]
+
+    if not device_gates.empty:
+        heat=device_gates.pivot_table(
+            index="transform",
+            columns="gate",
+            values="count",
+            aggfunc="sum",
+            fill_value=0,
+        )
+
+        plt.figure(
+            figsize=(
+                max(9,1.1*len(heat.columns)),
+                5,
+            )
+        )
+        sns.heatmap(
+            heat,
+            annot=True,
+            fmt=".0f",
+        )
+        plt.xlabel("Native / transpiled operation")
+        plt.ylabel("Quantum transform")
+        plt.title("FakeSherbrooke Gate Composition")
+        plt.tight_layout()
+        plt.savefig(
+            plots_dir/"32_quantum_resource_gate_heatmap.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+
+    # 33 — StatePreparation depth overhead
+    depth=resources.pivot_table(
+        index="transform",
+        columns="scope",
+        values="depth",
+        aggfunc="mean",
+    )
+
+    if {
+        "transform_only",
+        "stateprep_transform",
+    }.issubset(depth.columns):
+
+        overhead=(
+            depth["stateprep_transform"]
+            / depth["transform_only"]
+        )
+
+        plt.figure(figsize=(8,5))
+        plt.bar(
+            overhead.index,
+            overhead.values,
+        )
+        plt.xlabel("Quantum transform")
+        plt.ylabel("Depth overhead ratio")
+        plt.title("StatePreparation Circuit-Depth Overhead")
+        plt.tight_layout()
+        plt.savefig(
+            plots_dir/"33_stateprep_depth_overhead.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+
+    # 34 — Device mapping depth overhead
+    if {
+        "stateprep_transform",
+        "FakeSherbrooke",
+    }.issubset(depth.columns):
+
+        overhead=(
+            depth["FakeSherbrooke"]
+            / depth["stateprep_transform"]
+        )
+
+        plt.figure(figsize=(8,5))
+        plt.bar(
+            overhead.index,
+            overhead.values,
+        )
+        plt.xlabel("Quantum transform")
+        plt.ylabel("Depth overhead ratio")
+        plt.title("FakeSherbrooke Mapping Depth Overhead")
+        plt.tight_layout()
+        plt.savefig(
+            plots_dir/"34_device_mapping_depth_overhead.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+
+    # 37 — Circuit construction time
+    plt.figure(figsize=(10,6))
+    sns.barplot(
+        data=resources,
+        x="transform",
+        y="build_time_s",
+        hue="scope",
+    )
+    plt.xlabel("Quantum transform")
+    plt.ylabel("Build time (s)")
+    plt.title("Quantum Circuit Construction Time")
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir/"37_quantum_resource_build_time.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    # 38 — Transpilation time
+    plt.figure(figsize=(10,6))
+    sns.barplot(
+        data=resources,
+        x="transform",
+        y="transpile_time_s",
+        hue="scope",
+    )
+    plt.xlabel("Quantum transform")
+    plt.ylabel("Transpilation time (s)")
+    plt.title("Quantum Circuit Transpilation Time")
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir/"38_quantum_resource_transpile_time.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    # 39 — Estimated QPU execution duration
+    device=resources[
+        (resources["scope"]=="FakeSherbrooke")
+        & resources["estimated_qpu_us"].notna()
+    ]
+
+    if not device.empty:
+        plt.figure(figsize=(9,6))
+        sns.barplot(
+            data=device,
+            x="transform",
+            y="estimated_qpu_us",
+        )
+        plt.xlabel("Quantum transform")
+        plt.ylabel("Estimated execution duration (µs)")
+        plt.title("Estimated FakeSherbrooke Circuit Duration")
+        plt.tight_layout()
+        plt.savefig(
+            plots_dir/"39_quantum_resource_qpu_duration.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
 
 def run_noise_analysis(clean_signal, noisy_signal, output_csv):
     fake=FakeSherbrooke()
@@ -1395,7 +2003,9 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
         noisy_qc=tqc.copy()
         noisy_qc.save_density_matrix()
 
+        t0=perf_counter()
         result=simulator.run(noisy_qc).result()
+        simulation_time=perf_counter()-t0
         rho=DensityMatrix(result.data(0)["density_matrix"])
 
         fidelity=float(state_fidelity(ideal,rho))
@@ -1415,6 +2025,7 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
             "depth":tqc.depth(),
             "size":tqc.size(),
             "ops":dict(tqc.count_ops()),
+            "simulation_time_s":simulation_time,
         }
 
     def noise_analyze_recording(signal, simulator, device_name):
@@ -1427,6 +2038,7 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
             depths = []
             sizes = []
             twoq = []
+            simulation_times = []
 
             for window in windows:
                 if np.linalg.norm(window) <= 1e-15:
@@ -1443,6 +2055,7 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
                 leakages.append(m["leakage"])
                 depths.append(m["depth"])
                 sizes.append(m["size"])
+                simulation_times.append(m["simulation_time_s"])
 
                 ops = (
                     m["ops"]
@@ -1471,6 +2084,9 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
                 "size_std": float(np.std(sizes)) if sizes else np.nan,
                 "twoq_mean": float(np.mean(twoq)) if twoq else np.nan,
                 "twoq_std": float(np.std(twoq)) if twoq else np.nan,
+                "simulation_time_mean_s":float(np.mean(simulation_times)) if simulation_times else np.nan,
+                "simulation_time_std_s":float(np.std(simulation_times)) if simulation_times else np.nan,
+                "simulation_time_total_s":float(np.sum(simulation_times)) if simulation_times else np.nan,
             })
 
         return pd.DataFrame(rows)
@@ -1624,6 +2240,31 @@ def main():
 
     if SAVE_PLOTS:
         save_plots(full_results, output_dir / "plots")
+
+    if SAVE_CIRCUIT_RESOURCES and MODE in {"quantum","all"}:
+        row=experiment_metadata.iloc[0]
+        sample=load_cw_sample(row)
+        windows,_,_=split_windows(sample["clean"])
+
+        nonzero_windows=[
+            window
+            for window in windows
+            if np.linalg.norm(window)>1e-15
+        ]
+
+        if not nonzero_windows:
+            raise ValueError(
+                "No nonzero window available for circuit resource analysis."
+            )
+
+        representative_window=nonzero_windows[
+            len(nonzero_windows)//2
+        ]
+
+        save_quantum_circuit_resources(
+            representative_window,
+            output_dir,
+        )
 
     if RUN_NOISE:
         # Use the first selected row as the notebook-style representative recording.
