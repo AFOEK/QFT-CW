@@ -20,6 +20,7 @@ from qiskit.circuit.library import StatePreparation, HGate, SwapGate, MCXGate, S
 from qiskit.quantum_info import Statevector, DensityMatrix, state_fidelity
 from qiskit_aer import AerSimulator
 from qiskit_ibm_runtime.fake_provider import FakeSherbrooke
+from qiskit_aer.noise import NoiseModel
 
 import matplotlib
 matplotlib.use("Agg", force=True)
@@ -1227,10 +1228,30 @@ def save_plots(full_results,plots_dir):
 
         noisy10=noisy_df[noisy_df["snr_requested_db"]==10]
         if not noisy10.empty:
-            g=sns.relplot(data=noisy10,x="retention_pct",y="snr_vs_clean_db",hue="transform",col="wpm",col_wrap=3,kind="line",marker="o",estimator="mean",errorbar="sd",height=3.8,aspect=1.15)
-            g.set_axis_labels("Retained coefficients (%)","SNR vs clean CW (dB)")
+            n_wpm=noisy10["wpm"].nunique()
+            g=sns.relplot(
+                data=noisy10,
+                x="retention_pct",
+                y="snr_vs_clean_db",
+                hue="transform",
+                col="wpm",
+                col_wrap=min(3,n_wpm),
+                kind="line",
+                marker="o",
+                estimator="mean",
+                errorbar="sd",
+                height=3.8,
+                aspect=1.15,
+            )
+            g.set_axis_labels(
+                "Retained coefficients (%)",
+                "SNR vs clean CW (dB)",
+            )
             g.set_titles("{col_name} WPM — 10 dB input")
-            for ax in g.axes.flat: ax.invert_xaxis()
+
+            for ax in g.axes.flat:
+                ax.invert_xaxis()
+
             save_grid(g,"08_noisy_snr_by_wpm_10db.png")
 
         five=noisy_df[np.isclose(noisy_df["retention_requested"],0.05)]
@@ -1262,7 +1283,21 @@ def save_plots(full_results,plots_dir):
         plt.gca().invert_xaxis()
         save_current("05_family_clean_rmse.png")
 
-        g=sns.relplot(data=clean,x="retention_pct",y="rmse_vs_clean",hue="transform",col="wpm",col_wrap=3,kind="line",marker="o",estimator="mean",errorbar="sd",height=3.8,aspect=1.15)
+        n_wpm=clean["wpm"].nunique()
+        g=sns.relplot(
+            data=clean,
+            x="retention_pct",
+            y="rmse_vs_clean",
+            hue="transform",
+            col="wpm",
+            col_wrap=min(3,n_wpm),
+            kind="line",
+            marker="o",
+            estimator="mean",
+            errorbar="sd",
+            height=3.8,
+            aspect=1.15,
+        )
         g.set_axis_labels("Retained coefficients (%)","RMSE")
         g.set_titles("{col_name} WPM")
         for ax in g.axes.flat: ax.invert_xaxis()
@@ -1314,16 +1349,17 @@ def save_plots(full_results,plots_dir):
 
 
 def run_noise_analysis(clean_signal, noisy_signal, output_csv):
-    fake_devices = {
-        "ideal": None,
-        "FakeSherbrooke": FakeSherbrooke(),
-    }
+    fake=FakeSherbrooke()
+    sherbrooke_noise=NoiseModel.from_backend(fake)
 
-    noise_simulators = {
-        name: AerSimulator(method="density_matrix")
-        if backend is None
-        else AerSimulator.from_backend(backend, method="density_matrix")
-        for name, backend in fake_devices.items()
+    noise_simulators={
+        "ideal":AerSimulator(
+            method="density_matrix",
+        ),
+        "FakeSherbrooke":AerSimulator(
+            method="density_matrix",
+            noise_model=sherbrooke_noise
+        ),
     }
 
     noisy_transforms = {
@@ -1333,49 +1369,52 @@ def run_noise_analysis(clean_signal, noisy_signal, output_csv):
         "QDWT": cached_qhaar,
     }
 
-    def run_noisy_transform(x, transform, simulator):
-        qc, norm, n = build_transform_pipeline(x, transform)
+    def run_noisy_transform(x,transform,simulator):
+        qc,norm,n=build_transform_pipeline(x,transform)
 
         if qc is None:
             return {
-                "fidelity": 1.0,
-                "leakage": 0.0,
-                "depth": 0,
-                "size": 0,
-                "ops": {},
+                "fidelity":1.0,
+                "leakage":0.0,
+                "depth":0,
+                "size":0,
+                "ops":{},
             }
 
-        ideal = Statevector.from_instruction(qc)
-
-        noisy_qc = qc.copy()
-        noisy_qc.save_density_matrix()
-
-        tqc = transpile(
-            noisy_qc,
+        # First compile only the real quantum circuit.
+        tqc=transpile(
+            qc,
             simulator,
             optimization_level=1,
         )
 
-        result = simulator.run(tqc).result()
-        rho = DensityMatrix(result.data(0)["density_matrix"])
+        # Ideal reference of the exact transpiled circuit.
+        ideal=Statevector.from_instruction(tqc)
 
-        fidelity = float(state_fidelity(ideal, rho))
-        leakage = 0.0
+        # Aer-only save instruction is added AFTER transpilation.
+        noisy_qc=tqc.copy()
+        noisy_qc.save_density_matrix()
 
-        if transform.num_qubits == n + 1:
-            N = 2 ** n
-            diagonal = np.real(np.diag(rho.data))
-            leakage = max(
+        result=simulator.run(noisy_qc).result()
+        rho=DensityMatrix(result.data(0)["density_matrix"])
+
+        fidelity=float(state_fidelity(ideal,rho))
+        leakage=0.0
+
+        if transform.num_qubits==n+1:
+            N=2**n
+            diagonal=np.real(np.diag(rho.data))
+            leakage=max(
                 0.0,
-                1.0 - float(np.sum(diagonal[:N])),
+                1.0-float(np.sum(diagonal[:N])),
             )
 
         return {
-            "fidelity": fidelity,
-            "leakage": leakage,
-            "depth": tqc.depth(),
-            "size": tqc.size(),
-            "ops": dict(tqc.count_ops()),
+            "fidelity":fidelity,
+            "leakage":leakage,
+            "depth":tqc.depth(),
+            "size":tqc.size(),
+            "ops":dict(tqc.count_ops()),
         }
 
     def noise_analyze_recording(signal, simulator, device_name):
