@@ -63,7 +63,7 @@ Q_BATCH_SIZE=32
 SAVE_PLOTS=True
 SAVE_RECONSTRUCTED=True
 RUN_NOISE=True
-NOISE_MAX_WINDOWS=32
+NOISE_MAX_WINDOWS=64
 
 SAVE_CIRCUIT_RESOURCES=True
 SAVE_CIRCUIT_DRAWINGS=True
@@ -1374,7 +1374,7 @@ def save_plots(full_results,plots_dir):
             kind="line",
             marker="o",
             estimator="mean",
-            errorbar="sd",
+            errorbar=None,
             height=3.8,
             aspect=1.15,
         )
