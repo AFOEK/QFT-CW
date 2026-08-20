@@ -63,7 +63,7 @@ Q_BATCH_SIZE=32
 SAVE_PLOTS=True
 SAVE_RECONSTRUCTED=True
 RUN_NOISE=True
-NOISE_MAX_WINDOWS=64
+NOISE_MAX_WINDOWS=None
 
 SAVE_CIRCUIT_RESOURCES=True
 SAVE_CIRCUIT_DRAWINGS=True
@@ -1097,7 +1097,7 @@ def save_noise_plots(noise_results, plots_dir):
             plt.ylim(*ylim)
         plt.legend()
         plt.tight_layout()
-        plt.savefig(plots_dir / filename, dpi=300, bbox_inches="tight")
+        plt.savefig(plots_dir / filename, dpi=350, bbox_inches="tight")
         plt.close()
 
     # fidelity / leakage for clean and noisy inputs separately
@@ -1128,7 +1128,7 @@ def save_noise_plots(noise_results, plots_dir):
             plt.ylabel("Fidelity drop")
             plt.title(f"Fidelity Drop: Ideal vs FakeSherbrooke ({signal_type})")
             plt.tight_layout()
-            plt.savefig(plots_dir / f"19_noise_fidelity_drop_{signal_type}.png", dpi=300, bbox_inches="tight")
+            plt.savefig(plots_dir / f"19_noise_fidelity_drop_{signal_type}.png", dpi=350, bbox_inches="tight")
             plt.close()
 
     fake=df[df["device"]=="FakeSherbrooke"].copy()
@@ -1150,7 +1150,7 @@ def save_noise_plots(noise_results, plots_dir):
         plt.tight_layout()
         plt.savefig(
             plots_dir/"35_resource_cost_vs_fidelity.png",
-            dpi=300,
+            dpi=350,
             bbox_inches="tight",
         )
         plt.close()
@@ -1171,7 +1171,7 @@ def save_noise_plots(noise_results, plots_dir):
         plt.tight_layout()
         plt.savefig(
             plots_dir/"36_depth_vs_fidelity.png",
-            dpi=300,
+            dpi=350,
             bbox_inches="tight",
         )
         plt.close()
@@ -1200,12 +1200,12 @@ def save_plots(full_results,plots_dir):
 
     def save_grid(g,name):
         g.figure.tight_layout()
-        g.figure.savefig(plots_dir/name,dpi=300,bbox_inches="tight")
+        g.figure.savefig(plots_dir/name,dpi=350,bbox_inches="tight")
         plt.close(g.figure)
 
     def save_current(name):
         plt.tight_layout()
-        plt.savefig(plots_dir/name,dpi=300,bbox_inches="tight")
+        plt.savefig(plots_dir/name,dpi=350,bbox_inches="tight")
         plt.close()
 
     # -------------------------------------------------------------------------
@@ -1499,24 +1499,183 @@ def build_resource_pipeline(window,transform):
 
     return qc
 
+def save_circuit_chunks(qc,path_prefix,chunk_size=400,max_chunks=3):
+    path_prefix=Path(path_prefix)
+    total=len(qc.data)
+    chunks=min(max_chunks,int(np.ceil(total/chunk_size)))
 
-def save_circuit_drawing(qc,path,label):
+    for ci in range(chunks):
+        start=ci*chunk_size
+        stop=min(start+chunk_size,total)
+
+        sub=QuantumCircuit(
+            qc.num_qubits,
+            qc.num_clbits,
+        )
+
+        for inst in qc.data[start:stop]:
+            qargs=[
+                sub.qubits[
+                    qc.find_bit(q).index
+                ]
+                for q in inst.qubits
+            ]
+
+            cargs=[
+                sub.clbits[
+                    qc.find_bit(c).index
+                ]
+                for c in inst.clbits
+            ]
+
+            sub.append(
+                inst.operation,
+                qargs,
+                cargs,
+            )
+
+        fig=sub.draw(
+            output="mpl",
+            fold=40,
+            idle_wires=False,
+        )
+
+        filename=(
+            path_prefix.parent/
+            f"{path_prefix.name}_part{ci+1:02d}.png"
+        )
+
+        try:
+            fig.savefig(
+                filename,
+                dpi=250,
+                bbox_inches="tight",
+            )
+        except RuntimeError as e:
+            print(
+                f"    circuit chunk {ci+1} "
+                f"PNG skipped: {e}"
+            )
+
+        plt.close(fig)
+
+        print(
+            f"    saved circuit chunk "
+            f"{ci+1}/{chunks}: "
+            f"operations {start}-{stop-1}"
+        )
+
+def save_block_circuit_drawing(qc,path,label):
     wrapper=QuantumCircuit(qc.num_qubits)
-    wrapper.append(
-        qc.to_instruction(label=label),
-        range(qc.num_qubits),
+    wrapper.append(qc.to_instruction(label=label), range(qc.num_qubits))
+    fig=wrapper.draw(output="mpl", fold=-1, idle_wires=False)
+    fig.savefig(path, dpi=350, bbox_inches="tight")
+    plt.close(fig)
+
+def save_expanded_circuit_drawing(qc,path,reps=2,max_ops=1200):
+    path=Path(path)
+    expanded=qc.decompose(reps=reps)
+
+    print(
+        f"    expanded drawing: reps={reps} "
+        f"depth={expanded.depth()} "
+        f"size={expanded.size()}"
     )
 
-    fig=wrapper.draw(
+    if expanded.size()>max_ops:
+        print(
+            f"    expanded circuit too large to draw "
+            f"({expanded.size()} ops > {max_ops}); "
+            f"saving representative chunks instead"
+        )
+        save_circuit_chunks(
+            expanded,
+            path.parent/path.stem,
+            chunk_size=400,
+            max_chunks=3,
+        )
+        return
+
+    fig=expanded.draw(
         output="mpl",
-        fold=-1,
+        fold=40,
         idle_wires=False,
     )
-    fig.savefig(
-        path,
-        dpi=300,
-        bbox_inches="tight",
+
+    try:
+        fig.savefig(
+            path.with_suffix(".png"),
+            dpi=250,
+            bbox_inches="tight",
+        )
+    except RuntimeError as e:
+        print(f"    PNG expanded drawing skipped: {e}")
+
+    try:
+        fig.savefig(
+            path.with_suffix(".pdf"),
+            bbox_inches="tight",
+        )
+    except Exception as e:
+        print(f"    PDF expanded drawing skipped: {e}")
+
+    plt.close(fig)
+
+def save_native_circuit_drawing(qc,path,basis_gates=None,backend=None,opt_level=1,max_ops=1200):
+    path=Path(path)
+
+    if backend is not None:
+        native=transpile(
+            qc,
+            backend,
+            optimization_level=opt_level,
+            seed_transpiler=SEED,
+        )
+    else:
+        native=transpile(
+            qc,
+            basis_gates=basis_gates,
+            optimization_level=opt_level,
+            seed_transpiler=SEED,
+        )
+
+    print(
+        f"    native drawing: "
+        f"depth={native.depth()} "
+        f"size={native.size()} "
+        f"ops={dict(native.count_ops())}"
     )
+
+    if native.size()>max_ops:
+        print(
+            f"    native circuit too large to draw "
+            f"({native.size()} ops > {max_ops}); "
+            f"saving representative chunks"
+        )
+
+        save_circuit_chunks(
+            native,
+            path.parent/path.stem,
+            chunk_size=400,
+            max_chunks=3,
+        )
+        return
+
+    fig=native.draw(
+        output="mpl",
+        fold=40,
+        idle_wires=False,
+    )
+
+    try:
+        fig.savefig(
+            path.with_suffix(".png"),
+            dpi=250,
+            bbox_inches="tight",
+        )
+    except RuntimeError as e:
+        print(f"    native PNG skipped: {e}")
+
     plt.close(fig)
 
 
@@ -1528,7 +1687,7 @@ def save_detailed_circuit_drawing(qc,path):
     )
     fig.savefig(
         path,
-        dpi=300,
+        dpi=350,
         bbox_inches="tight",
     )
     plt.close(fig)
@@ -1652,11 +1811,10 @@ def save_quantum_circuit_resources(representative_window,output_dir):
         # Circuit drawings
         # -------------------------------------------------------------
         if SAVE_CIRCUIT_DRAWINGS:
-            save_circuit_drawing(
-                transform,
-                circuits_dir/f"{name.lower()}_block.png",
-                name,
-            )
+            save_block_circuit_drawing(transform, circuits_dir/f"{name.lower()}_block.png", name)
+            save_expanded_circuit_drawing(transform, circuits_dir/f"{name.lower()}_expanded.png", reps=2)
+            save_native_circuit_drawing(transform, circuits_dir/f"{name.lower()}_native_basis.png", basis_gates=RESOURCE_BASIS, opt_level=RESOURCE_OPT_LEVEL)
+            save_native_circuit_drawing(transform, circuits_dir/f"{name.lower()}_fake_sherbrooke.png", backend=fake, opt_level=RESOURCE_OPT_LEVEL)
 
             if SAVE_DETAILED_CIRCUITS:
                 save_detailed_circuit_drawing(
@@ -1715,7 +1873,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
     plt.tight_layout()
     plt.savefig(
         plots_dir/"27_quantum_resource_depth.png",
-        dpi=300,
+        dpi=350,
         bbox_inches="tight",
     )
     plt.close()
@@ -1735,7 +1893,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
     plt.tight_layout()
     plt.savefig(
         plots_dir/"28_quantum_resource_size.png",
-        dpi=300,
+        dpi=350,
         bbox_inches="tight",
     )
     plt.close()
@@ -1755,7 +1913,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
     plt.tight_layout()
     plt.savefig(
         plots_dir/"29_quantum_resource_twoq.png",
-        dpi=300,
+        dpi=350,
         bbox_inches="tight",
     )
     plt.close()
@@ -1778,7 +1936,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
         plt.tight_layout()
         plt.savefig(
             plots_dir/"30_quantum_resource_twoq_depth.png",
-            dpi=300,
+            dpi=350,
             bbox_inches="tight",
         )
         plt.close()
@@ -1801,7 +1959,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
         plt.tight_layout()
         plt.savefig(
             plots_dir/"31_quantum_resource_qubits.png",
-            dpi=300,
+            dpi=350,
             bbox_inches="tight",
         )
         plt.close()
@@ -1837,7 +1995,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
         plt.tight_layout()
         plt.savefig(
             plots_dir/"32_quantum_resource_gate_heatmap.png",
-            dpi=300,
+            dpi=350,
             bbox_inches="tight",
         )
         plt.close()
@@ -1871,7 +2029,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
         plt.tight_layout()
         plt.savefig(
             plots_dir/"33_stateprep_depth_overhead.png",
-            dpi=300,
+            dpi=350,
             bbox_inches="tight",
         )
         plt.close()
@@ -1898,7 +2056,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
         plt.tight_layout()
         plt.savefig(
             plots_dir/"34_device_mapping_depth_overhead.png",
-            dpi=300,
+            dpi=350,
             bbox_inches="tight",
         )
         plt.close()
@@ -1917,7 +2075,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
     plt.tight_layout()
     plt.savefig(
         plots_dir/"37_quantum_resource_build_time.png",
-        dpi=300,
+        dpi=350,
         bbox_inches="tight",
     )
     plt.close()
@@ -1936,7 +2094,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
     plt.tight_layout()
     plt.savefig(
         plots_dir/"38_quantum_resource_transpile_time.png",
-        dpi=300,
+        dpi=350,
         bbox_inches="tight",
     )
     plt.close()
@@ -1960,7 +2118,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
         plt.tight_layout()
         plt.savefig(
             plots_dir/"39_quantum_resource_qpu_duration.png",
-            dpi=300,
+            dpi=350,
             bbox_inches="tight",
         )
         plt.close()
@@ -1994,7 +2152,7 @@ def run_noise_analysis(noise_metadata,output_csv):
         if len(valid)==0:
             return np.array([],dtype=int)
 
-        if len(valid)<=NOISE_MAX_WINDOWS:
+        if NOISE_MAX_WINDOWS is None or len(valid)<=NOISE_MAX_WINDOWS:
             return valid
 
         positions=np.linspace(
@@ -2156,7 +2314,7 @@ def run_noise_analysis(noise_metadata,output_csv):
                     twoq_count
                 )
 
-                if wi%4==0 or wi==len(windows):
+                if wi%25==0 or wi==len(windows):
                     print(
                         f"\r      {name}: "
                         f"{wi}/{len(windows)}",
@@ -2177,6 +2335,7 @@ def run_noise_analysis(noise_metadata,output_csv):
                 "signal_type":signal_type,
                 "device":device_name,
                 "transform":name,
+                "windows_available":len(windows),
                 "windows_tested":len(fidelities),
                 "fidelity_mean":float(np.mean(fidelities)) if fidelities else np.nan,
                 "fidelity_std":float(np.std(fidelities)) if fidelities else np.nan,
