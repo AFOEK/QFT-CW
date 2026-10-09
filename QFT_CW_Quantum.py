@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-# Keep Qiskit's own process parallelism off; StatePreparation uses one persistent pool below.
-# Aer still uses its native thread/experiment parallelism.
 os.environ.setdefault("QISKIT_PARALLEL", "FALSE")
 
 import multiprocessing as mp
@@ -64,6 +62,15 @@ SAVE_PLOTS=True
 SAVE_RECONSTRUCTED=True
 RUN_NOISE=True
 NOISE_MAX_WINDOWS=None
+
+SAMPLE_RATE=8000
+RUN_SUPPORT_RECOVERY=True
+SUPPORT_RETENTIONS=[0.10,0.05,0.02,0.01]
+SUPPORT_SHOTS=[32,64,128,256,512,1024,2048,4096,8192]
+SUPPORT_TRIALS=30
+SUPPORT_TARGET_RECALL=0.95
+SUPPORT_TARGET_ENERGY=0.99
+SUPPORT_TARGET_SUCCESS=0.95
 
 SAVE_CIRCUIT_RESOURCES=True
 SAVE_CIRCUIT_DRAWINGS=True
@@ -496,6 +503,45 @@ def topk_prune_fourier_batch(coeffs, retention):
 
     return np.where(keep, coeffs, 0), keep.sum(axis=1)
 
+def support_groups(n,fourier=False):
+    if not fourier:return [[i] for i in range(n)]
+    groups=[[0]]
+    if n%2==0:groups.append([n//2])
+    groups.extend([[k,n-k] for k in range(1,n//2)])
+    return groups
+
+def select_support(scores,retention,fourier=False,observed_only=False):
+    scores=np.asarray(scores,dtype=float)
+    n=len(scores)
+    target=max(1,int(np.ceil(n*retention)))
+    groups=support_groups(n,fourier)
+    gs=np.asarray([np.sum(scores[g]) for g in groups],dtype=float)
+    order=np.argsort(gs)[::-1]
+    keep=[];selected=[]
+    for gi in order:
+        if observed_only and gs[gi]<=0:break
+        keep.extend(groups[gi]);selected.append(int(gi))
+        if len(set(keep))>=target:break
+    return np.asarray(sorted(set(keep)),dtype=int),np.asarray(selected,dtype=int),gs
+
+def support_metrics(true_idx,recovered_idx,true_probs):
+    true=set(map(int,true_idx));rec=set(map(int,recovered_idx));inter=true&rec;union=true|rec
+    precision=len(inter)/len(rec) if rec else 0.0
+    recall=len(inter)/len(true) if true else 1.0
+    jaccard=len(inter)/len(union) if union else 1.0
+    denom=float(np.sum(true_probs[list(true)])) if true else 0.0
+    energy=float(np.sum(true_probs[list(inter)]))/denom if denom>0 else 1.0
+    total_energy=float(np.sum(true_probs[list(rec)])) if rec else 0.0
+    return {"precision":precision,"recall":recall,"jaccard":jaccard,"energy_recovery":energy,"retained_energy":total_energy,"exact_support":float(true==rec)}
+
+def support_probability_gap(true_probs,retention,fourier=False):
+    _,selected,gs=select_support(true_probs,retention,fourier)
+    if len(selected)==0:return np.nan
+    selected_set=set(selected)
+    sel_scores=[gs[i] for i in selected]
+    remaining=[gs[i] for i in range(len(gs)) if i not in selected_set]
+    return float(min(sel_scores)-max(remaining)) if remaining else np.nan
+
 def prune_coeffs_batch(coeffs, retention, fourier=False):
     return topk_prune_fourier_batch(coeffs, retention) if fourier else topk_prune_batch(coeffs, retention)
 
@@ -532,6 +578,55 @@ def compress_window(window, forward_fn, inverse_fn, retention, fourier=False):
         "inverse_qc": inverse_qc,
         "forward_leakage": forward_leakage,
         "inverse_leakage": inverse_leakage,
+    }
+
+def measurement_support_trials(ideal_probs,measured_probs,retention,shots,trials,rng,fourier=False,branch=False,data_dim=WINDOW_SIZE):
+    ideal_probs=np.asarray(ideal_probs,dtype=float)
+    measured_probs=np.asarray(measured_probs,dtype=float)
+    measured_probs=np.clip(measured_probs,0,None)
+    measured_probs/=measured_probs.sum()
+
+    true_probs=ideal_probs[:data_dim].copy()
+    true_probs=np.clip(true_probs,0,None)
+    true_probs/=true_probs.sum()
+
+    true_idx,_,_=select_support(true_probs,retention,fourier)
+    gap=support_probability_gap(true_probs,retention,fourier)
+
+    metrics=[]
+    for _ in range(trials):
+        # counts=np.random.default_rng(rng.integers(0,2**63-1)).multinomial(shots,measured_probs)
+        counts=rng.multinomial(shots,measured_probs)
+        if branch:
+            valid_counts=counts[:data_dim]
+        else:
+            valid_counts=counts
+        valid_shots=int(valid_counts.sum())
+        recovered_idx,_,_=select_support(valid_counts,retention,fourier,observed_only=True)
+        m=support_metrics(true_idx,recovered_idx,true_probs)
+        m["valid_fraction"]=valid_shots/shots
+        m["recovered_coeffs"]=len(recovered_idx)
+        m["success"]=float(m["recall"]>=SUPPORT_TARGET_RECALL and m["energy_recovery"]>=SUPPORT_TARGET_ENERGY)
+        metrics.append(m)
+
+    df=pd.DataFrame(metrics)
+    return {
+        "target_coeffs":len(true_idx),
+        "probability_gap":gap,
+        "precision_mean":df["precision"].mean(),
+        "precision_std":df["precision"].std(ddof=0),
+        "recall_mean":df["recall"].mean(),
+        "recall_std":df["recall"].std(ddof=0),
+        "jaccard_mean":df["jaccard"].mean(),
+        "energy_recovery_mean":df["energy_recovery"].mean(),
+        "energy_recovery_std":df["energy_recovery"].std(ddof=0),
+        "exact_support_rate":df["exact_support"].mean(),
+        "valid_fraction_mean":df["valid_fraction"].mean(),
+        "valid_fraction_std":df["valid_fraction"].std(ddof=0),
+        "retained_energy_mean":df["retained_energy"].mean(),
+        "retained_energy_std":df["retained_energy"].std(ddof=0),
+        "recovered_coeffs_mean":df["recovered_coeffs"].mean(),
+        "success_rate":df["success"].mean(),
     }
 
 def waveform_metrics(original, reconstructed):
@@ -1712,6 +1807,7 @@ def save_quantum_circuit_resources(representative_window,output_dir):
 
     rows=[]
     gate_rows=[]
+    measured_rows=[]
 
     for name,builder in transform_builders.items():
         print(f"Resource analysis: {name}")
@@ -1753,6 +1849,44 @@ def save_quantum_circuit_resources(representative_window,output_dir):
             seed_transpiler=SEED,
         )
         device_transpile_time=perf_counter()-t0
+
+        measured_cases={
+            "classical_input":pipeline.copy(),
+            "quantum_native_input":transform.copy(),
+        }
+
+        for input_regime,measured in measured_cases.items():
+            measured.measure_all()
+
+            t0=perf_counter()
+            mapped_measured=transpile(
+                measured,
+                fake,
+                optimization_level=RESOURCE_OPT_LEVEL,
+                seed_transpiler=SEED,
+            )
+            measured_transpile_time=perf_counter()-t0
+
+            duration_us=estimated_qpu_duration_us(
+                mapped_measured,
+                fake.target,
+            )
+
+            mm=circuit_resource_metrics(mapped_measured)
+
+            measured_rows.append({
+                "transform":name,
+                "input_regime":input_regime,
+                "qubits":mm["qubits"],
+                "depth":mm["depth"],
+                "size":mm["size"],
+                "oneq":mm["oneq"],
+                "twoq":mm["twoq"],
+                "multiq":mm["multiq"],
+                "twoq_depth":mm["twoq_depth"],
+                "transpile_time_s":measured_transpile_time,
+                "estimated_qpu_us_per_shot":duration_us,
+            })
 
         qpu_duration_us=estimated_qpu_duration_us(
             device_pipeline,
@@ -1830,6 +1964,13 @@ def save_quantum_circuit_resources(representative_window,output_dir):
         index=False,
     )
 
+    measured_resources=pd.DataFrame(measured_rows)
+
+    measured_resources.to_csv(
+        output_dir/"cw_quantum_measured_pipeline_resources.csv",
+        index=False,
+    )
+
     gates.to_csv(
         output_dir/"cw_quantum_gate_counts.csv",
         index=False,
@@ -1846,7 +1987,83 @@ def save_quantum_circuit_resources(representative_window,output_dir):
         f"{(output_dir/'cw_quantum_circuit_resources.csv').resolve()}"
     )
 
-    return resources, gates
+    return resources, gates, measured_resources
+
+def build_end_to_end_cost_model(support_results,measured_resources,output_dir):
+    output_dir=Path(output_dir)
+
+    hardware=support_results[
+        support_results["device"]=="FakeSherbrooke"
+    ].copy()
+
+    summary=hardware.groupby(
+        ["device","transform","condition","retention","shots"],
+        as_index=False
+    ).agg(
+        recall=("recall_mean","mean"),
+        energy_recovery=("energy_recovery_mean","mean"),
+        retained_energy=("retained_energy_mean","mean"),
+        success_rate=("success_rate","mean"),
+        valid_fraction=("valid_fraction_mean","mean"),
+        probability_gap=("probability_gap","mean"),
+        windows=("window_index","nunique"),
+    )
+
+    duration_map=measured_resources.set_index(
+        ["transform","input_regime"]
+    )["estimated_qpu_us_per_shot"].to_dict()
+
+    rows=[]
+    window_ms=1000.0*WINDOW_SIZE/SAMPLE_RATE
+
+    for (device,transform,condition,retention),g in summary.groupby(
+        ["device","transform","condition","retention"]
+    ):
+        g=g.sort_values("shots")
+
+        eligible=g[
+            (g["recall"]>=SUPPORT_TARGET_RECALL)
+            & (g["energy_recovery"]>=SUPPORT_TARGET_ENERGY)
+            & (g["success_rate"]>=SUPPORT_TARGET_SUCCESS)
+        ]
+
+        threshold_met=not eligible.empty
+        chosen=eligible.iloc[0] if threshold_met else g.iloc[-1]
+        raw_shots=int(chosen["shots"])
+
+        for input_regime in ["classical_input","quantum_native_input"]:
+            per_shot_us=duration_map.get((transform,input_regime),np.nan)
+            active_ms=raw_shots*per_shot_us/1000.0 if np.isfinite(per_shot_us) else np.nan
+
+            rows.append({
+                "device":device,
+                "transform":transform,
+                "condition":condition,
+                "retention":retention,
+                "input_regime":input_regime,
+                "threshold_met":threshold_met,
+                "shots_required_or_max_tested":raw_shots,
+                "recall":chosen["recall"],
+                "energy_recovery":chosen["energy_recovery"],
+                "retained_energy":chosen["retained_energy"],
+                "success_rate":chosen["success_rate"],
+                "valid_fraction":chosen["valid_fraction"],
+                "probability_gap":chosen["probability_gap"],
+                "estimated_qpu_us_per_shot":per_shot_us,
+                "estimated_active_qpu_ms":active_ms,
+                "window_duration_ms":window_ms,
+                "realtime_ratio":active_ms/window_ms if np.isfinite(active_ms) else np.nan,
+                "nominal_within_window":bool(active_ms<=window_ms) if np.isfinite(active_ms) else False,
+            })
+
+    costs=pd.DataFrame(rows)
+
+    costs.to_csv(
+        output_dir/"cw_quantum_end_to_end_cost_model.csv",
+        index=False,
+    )
+
+    return costs
 
 def save_quantum_resource_plots(resources,gates,plots_dir):
     plots_dir=Path(plots_dir)
@@ -2126,6 +2343,7 @@ def save_quantum_resource_plots(resources,gates,plots_dir):
 def run_noise_analysis(noise_metadata,output_csv):
     fake=FakeSherbrooke()
     sherbrooke_noise=NoiseModel.from_backend(fake)
+    support_rng=np.random.default_rng(SEED)
 
     noise_simulators={
         "ideal":AerSimulator(
@@ -2196,6 +2414,11 @@ def run_noise_analysis(noise_metadata,output_csv):
             result.data(0)["density_matrix"]
         )
 
+        ideal_probs=np.abs(np.asarray(ideal.data))**2
+        noisy_probs=np.real(np.diag(rho.data))
+        noisy_probs=np.clip(noisy_probs,0,None)
+        noisy_probs/=noisy_probs.sum()
+
         fidelity=float(
             state_fidelity(
                 ideal,
@@ -2225,6 +2448,8 @@ def run_noise_analysis(noise_metadata,output_csv):
             "size":tqc.size(),
             "ops":dict(tqc.count_ops()),
             "simulation_time_s":simulation_time,
+            "ideal_probs":ideal_probs,
+            "measured_probs":noisy_probs,
         }
 
     def noise_analyze_recording(
@@ -2245,6 +2470,7 @@ def run_noise_analysis(noise_metadata,output_csv):
         windows=windows[window_indices]
 
         rows=[]
+        support_rows=[]
 
         print(
             f"    {signal_type}: "
@@ -2265,7 +2491,7 @@ def run_noise_analysis(noise_metadata,output_csv):
                 flush=True,
             )
 
-            for wi,window in enumerate(windows,1):
+            for wi,(original_window_index,window) in enumerate(zip(window_indices,windows),1):
                 if np.linalg.norm(window)<=1e-15:
                     continue
 
@@ -2276,6 +2502,37 @@ def run_noise_analysis(noise_metadata,output_csv):
                     builder(n),
                     simulator,
                 )
+                if RUN_SUPPORT_RECOVERY:
+                    fourier=(name=="QFT")
+                    branch=(name in {"QDCT","QDST"})
+
+                    for retention in SUPPORT_RETENTIONS:
+                        for shots in SUPPORT_SHOTS:
+                            sm=measurement_support_trials(
+                                m["ideal_probs"],
+                                m["measured_probs"],
+                                retention,
+                                shots,
+                                SUPPORT_TRIALS,
+                                support_rng,
+                                fourier=fourier,
+                                branch=branch,
+                                data_dim=WINDOW_SIZE,
+                            )
+
+                            support_rows.append({
+                                "message_id":row["message_id"],
+                                "wpm":row["wpm"],
+                                "snr_requested_db":np.nan if signal_type=="clean" else row["snr_requested_db"],
+                                "signal_type":signal_type,
+                                "condition":"clean" if signal_type=="clean" else f"{int(row['snr_requested_db']):+d} dB",
+                                "device":device_name,
+                                "transform":name,
+                                "window_index":int(original_window_index),
+                                "retention":retention,
+                                "shots":shots,
+                                **sm,
+                            })
 
                 fidelities.append(
                     m["fidelity"]
@@ -2353,9 +2610,10 @@ def run_noise_analysis(noise_metadata,output_csv):
                 "simulation_time_total_s":float(np.sum(simulation_times)) if simulation_times else np.nan,
             })
 
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows),pd.DataFrame(support_rows)
 
     all_noise_results=[]
+    all_support_results=[]
     clean_done=set()
 
     total_rows=len(noise_metadata)
@@ -2417,7 +2675,7 @@ def run_noise_analysis(noise_metadata,output_csv):
             )
 
             for signal_type,signal in signal_cases:
-                d=noise_analyze_recording(
+                d,s=noise_analyze_recording(
                     signal,
                     window_indices,
                     simulator,
@@ -2427,6 +2685,9 @@ def run_noise_analysis(noise_metadata,output_csv):
                 )
 
                 all_noise_results.append(d)
+
+                if not s.empty:
+                    all_support_results.append(s)
 
         if include_clean:
             clean_done.add(clean_id)
@@ -2448,6 +2709,14 @@ def run_noise_analysis(noise_metadata,output_csv):
         index=False,
     )
 
+    support_results=pd.concat(all_support_results,ignore_index=True) if all_support_results else pd.DataFrame()
+
+    if not support_results.empty:
+        support_path=output_csv.parent/"cw_quantum_support_recovery.csv"
+        support_results.to_csv(support_path,index=False)
+        save_support_recovery_plots(support_results,output_csv.parent/"plots")
+        print(f"Saved support recovery: {support_path.resolve()}")
+
     save_noise_plots(
         noise_results,
         output_csv.parent/"plots",
@@ -2458,8 +2727,80 @@ def run_noise_analysis(noise_metadata,output_csv):
         f"{output_csv.resolve()}"
     )
 
-    return noise_results
+    return noise_results, support_results
 
+def save_support_recovery_plots(df,plots_dir):
+    plots_dir=Path(plots_dir)
+    plots_dir.mkdir(parents=True,exist_ok=True)
+
+    summary=df.groupby(
+        ["device","transform","condition","retention","shots"],
+        as_index=False
+    ).agg(
+        recall=("recall_mean","mean"),
+        energy_recovery=("energy_recovery_mean","mean"),
+        retained_energy=("retained_energy_mean","mean"),
+        valid_fraction=("valid_fraction_mean","mean"),
+        success_rate=("success_rate","mean"),
+        probability_gap=("probability_gap","mean"),
+    )
+
+    fake=summary[summary["device"]=="FakeSherbrooke"].copy()
+
+    for retention in SUPPORT_RETENTIONS:
+        sub=fake[np.isclose(fake["retention"],retention)]
+        if sub.empty:
+            continue
+
+        g=sns.relplot(
+            data=sub,
+            x="shots",
+            y="recall",
+            hue="transform",
+            col="condition",
+            col_wrap=3,
+            kind="line",
+            marker="o",
+            height=3.6,
+            aspect=1.1,
+        )
+        g.set(xscale="log")
+        g.set_axis_labels("Measurement shots","Top-K support recall")
+        g.set_titles("{col_name}")
+        for ax in g.axes.flat:
+            ax.axhline(SUPPORT_TARGET_RECALL,linestyle="--",linewidth=1)
+            ax.set_ylim(0,1.02)
+        g.figure.tight_layout()
+        g.figure.savefig(
+            plots_dir/f"40_support_recall_r{int(retention*100):02d}.pdf",
+            bbox_inches="tight",
+        )
+        plt.close(g.figure)
+
+        g=sns.relplot(
+            data=sub,
+            x="shots",
+            y="energy_recovery",
+            hue="transform",
+            col="condition",
+            col_wrap=3,
+            kind="line",
+            marker="o",
+            height=3.6,
+            aspect=1.1,
+        )
+        g.set(xscale="log")
+        g.set_axis_labels("Measurement shots","Recovered dominant energy")
+        g.set_titles("{col_name}")
+        for ax in g.axes.flat:
+            ax.axhline(SUPPORT_TARGET_ENERGY,linestyle="--",linewidth=1)
+            ax.set_ylim(0,1.02)
+        g.figure.tight_layout()
+        g.figure.savefig(
+            plots_dir/f"41_support_energy_r{int(retention*100):02d}.pdf",
+            bbox_inches="tight",
+        )
+        plt.close(g.figure)
 
 def configure_paths(dataset):
     global CW_DATASET, CLEAN_DIR, NOISY_DIR, ENVELOPE_DIR, AUDIO_DIR, AUDIO_CLEAN_DIR, AUDIO_NOISY_DIR, METADATA_FILE
@@ -2576,6 +2917,8 @@ def main():
     if SAVE_PLOTS:
         save_plots(full_results, output_dir / "plots")
 
+    measured_resources=None
+
     if SAVE_CIRCUIT_RESOURCES and MODE in {"quantum","all"}:
         row=experiment_metadata.iloc[0]
         sample=load_cw_sample(row)
@@ -2596,16 +2939,27 @@ def main():
             len(nonzero_windows)//2
         ]
 
-        save_quantum_circuit_resources(
+        _,_,measured_resources=save_quantum_circuit_resources(
             representative_window,
             output_dir,
         )
 
     if RUN_NOISE:
-        run_noise_analysis(
+        noise_results,support_results=run_noise_analysis(
             quantum_metadata,
             output_dir/"cw_quantum_noise_results.csv",
         )
+
+        if (
+            RUN_SUPPORT_RECOVERY
+            and measured_resources is not None
+            and not support_results.empty
+        ):
+            build_end_to_end_cost_model(
+                support_results,
+                measured_resources,
+                output_dir,
+            )
 
 
 if __name__ == "__main__":
